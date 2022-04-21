@@ -1,0 +1,313 @@
+---
+title: "Net Benefit: A Framework for Assessing the Utility of Predictive Models"
+author: "Andrew Krumm"
+output: html_document
+---
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(broom)
+library(skimr)
+library(Hmisc)
+library(tidymodels) 
+library(runway)
+library(pROC)
+library(dcurves)
+```
+
+## Read in data
+Data originates from: https://analyse.kmi.open.ac.uk/open_dataset
+
+```{r message=FALSE, warning=FALSE}
+assessments <- read_csv("~/Data/OULAD/assessments.csv")
+courses <- read_csv("~/Data/OULAD/courses.csv")
+stdas <- read_csv("~/Data/OULAD/studentAssessment.csv")
+stdinf <- read_csv("~/Data/OULAD/studentInfo.csv")
+stdreg <- read_csv("~/Data/OULAD/studentRegistration.csv")
+stdvle <- read_csv("~/Data/OULAD/studentVle.csv")
+vle <- read_csv("~/Data/OULAD/vle.csv")
+```
+
+## Load and join data
+```{r}
+# Subset studentInfo one step further: presentation 2013J
+stdinf_f13j <- stdinf %>%
+  filter(code_module == "FFF" & code_presentation == "2013J")
+
+# Subset VLE
+stdvle_f13j <- stdvle %>%
+  filter(code_module == "FFF" & code_presentation == "2013J")
+
+# Count = VLE materials interacted with, could be duplicates
+stdvle_f13j_ag <- stdvle_f13j %>%
+  group_by(id_student) %>%
+  summarise(total_vle = n(),
+            unique_vle = n_distinct(id_site),
+            total_clicks = sum(sum_click),
+            days = n_distinct(date),
+            unique_perday = unique_vle / days)
+
+# Reduce variables inv the studentInf dataframe
+stdinf_f13j_s <- stdinf_f13j %>%
+  select(id_student, final_result, gender, disability, highest_education)
+
+# Join studentIng and studentVle aggregated at student level
+stdinf_f13j_s_vle_ag <- full_join(stdinf_f13j_s, stdvle_f13j_ag, by = "id_student")
+
+# Join student information with VLE activities
+stdinf_f13j_s_vle <- full_join(stdinf_f13j_s, stdvle_f13j, by = "id_student")
+
+# Join studentInf.csv subset and assessment studentAssessments.csv
+stdinf_f13j_s_as <- inner_join(stdinf_f13j_s, stdas, by = "id_student")
+stdinf_f13j_s_as <- left_join(stdinf_f13j_s_as, assessments, by = "id_assessment")
+stdinf_f13j_s_as <- stdinf_f13j_s_as %>%
+  filter(code_module == "FFF" & code_presentation == "2013J")
+```
+
+## Fillin missing assignments
+Fill in id_assessments for all students because not all students made it that far, but we will want to compare against these students "as if" they had made it.
+```{r}
+# Create a filled in data frame
+dump <- stdinf_f13j_s_as %>%
+  mutate(date = as.numeric(date)) %>%
+  filter(date <= 50) %>% 
+  tidyr::expand(nesting(id_student, final_result, code_module, code_presentation, assessment_type), id_assessment)
+```
+
+```{r}
+# Join filled in data frame with assessment information
+stdinf_f13j_s_as_fill <- left_join(dump, stdinf_f13j_s_as, by = c("id_student", "final_result", "code_module", "code_presentation", "assessment_type", "id_assessment"))
+```
+
+
+For comparison purposes, we want to use a relative measure, like a percent, so we will calculate the percent of students with each final result who completed the first four assessments. Create a count of students with a given final result.
+```{r}
+final <- stdinf_f13j %>%
+  group_by(final_result) %>%
+  summarise(final_count = n())
+
+# Join that count with the previous data frame
+stdinf_f13j_s_as_fill <- left_join(stdinf_f13j_s_as_fill, final, by = "final_result")
+
+# Create a variable that identifies whether a student turned in the assessment
+stdinf_f13j_s_as_fill <- stdinf_f13j_s_as_fill %>%
+  mutate(sub_assess = ifelse(is.na(date_submitted), 0, 1))
+```
+
+## Reshape assessment submission into columns
+```{r}
+# Reshape submission variables
+as_wide_sub <- stdinf_f13j_s_as_fill %>%
+  mutate(id_assessment= paste0("as_sub_", id_assessment)) %>%
+  select(id_student, id_assessment, sub_assess) %>%
+  spread(., id_assessment, sub_assess)
+```
+
+```{r}
+# Reshape score variables
+as_wide_scr <- stdinf_f13j_s_as_fill %>%
+  mutate(score = as.numeric(ifelse(score == "?", NA, score)),
+         id_assessment= paste0("as_scr_", id_assessment)) %>%
+  select(id_student, id_assessment, score) %>%
+  spread(., id_assessment, score)
+```
+
+```{r}
+# Count = VLE materials interacted with, could be duplicates
+stdvle_f13j_ag50 <- stdvle_f13j %>%
+  mutate(date = as.numeric(date)) %>%
+  filter(date <= 50) %>%
+  group_by(id_student) %>%
+  summarise(total_vle = n(),
+            unique_vle = n_distinct(id_site),
+            total_clicks = sum(sum_click),
+            days = n_distinct(date),
+            unique_perday = unique_vle / days)
+```
+
+## Join data frames
+```{r}
+# Combine reshaped data into one data frame for anlaysis
+df <- full_join(stdinf_f13j_s, as_wide_sub, by = "id_student")
+df <- full_join(df, as_wide_scr, by = "id_student")
+df <- full_join(df, stdvle_f13j_ag50, by = "id_student")
+```
+
+## Clean up Withdraw
+```{r}
+# Subset studentRegistraion.csv
+stdreg_f13j <- stdreg %>%
+  filter(code_module == "FFF" & code_presentation == "2013J")
+
+# Join with wide form data
+df <- left_join(df, stdreg_f13j, by = "id_student")
+
+# Clean up unregistration feature
+df <- df %>%
+  mutate(date_unregistration = ifelse(date_unregistration == "?", NA, date_unregistration),
+         date_unregistration = as.numeric(date_unregistration))
+
+# Subset data to those who did not withdraw before start of course
+df <- df %>%
+  filter(date_unregistration > 0 | is.na(date_unregistration))
+```
+
+## Cleaning up missing data
+```{r}
+# Replace missing with 0 when meaningful
+df <- df %>%
+  mutate(as_sub_34873 = ifelse(is.na(as_sub_34873), 0, as_sub_34873),
+         as_sub_34874 = ifelse(is.na(as_sub_34874), 0, as_sub_34874), 
+         as_scr_34873 = ifelse(is.na(as_scr_34873), 0, as_scr_34873),
+         as_scr_34874 = ifelse(is.na(as_scr_34874), 0, as_scr_34874),
+
+         total_vle = ifelse(is.na(total_vle), 0, total_vle),
+         unique_vle = ifelse(is.na(unique_vle), 0, unique_vle),
+         total_clicks = ifelse(is.na(total_clicks), 0, total_clicks),
+         days = ifelse(is.na(days), 0 , days),
+         unique_perday = ifelse(is.na(unique_perday), 0, unique_perday))
+```
+
+```{r}
+# Create dependent variable and reorder columns
+df <- df %>%
+  mutate(fail = ifelse(final_result == "Pass" | final_result == "Distinction", 0, 1),
+         total_as = as_sub_34873 + as_sub_34874) %>% 
+  select(id_student, code_module, code_presentation, date_registration, date_unregistration, final_result, fail, gender, highest_education, disability, total_vle, unique_vle, total_clicks, days, unique_perday, total_as, starts_with("as"))
+```
+
+## Build model
+Initial test-train split.
+```{r}
+set.seed(48103)
+
+splits <- initial_split(df, strata = fail)
+
+train <- training(splits)
+test  <- testing(splits)
+
+train <- train %>%
+  mutate(
+        as_scr_34873 = scale(as_scr_34873),
+        as_scr_34874 = scale(as_scr_34874))
+
+test <- test %>%
+  mutate(
+        as_scr_34873 = scale(as_scr_34873),
+        as_scr_34874 = scale(as_scr_34874))
+```
+
+## Baseline model
+```{r}
+assess1 <- glm(fail ~ as_scr_34873, 
+          data = train,
+          family = binomial)
+
+summary(assess1)
+```
+
+```{r}
+assess2 <- glm(fail ~ as_scr_34873 + as_scr_34874, 
+          data = train,
+          family = binomial)
+
+summary(assess2)
+```
+
+## Additional model
+```{r}
+additional <- glm(fail ~ days + unique_vle + total_vle + total_clicks +
+            as_scr_34873 + as_scr_34874 ,
+          data = train,
+          family = binomial)
+
+summary(additional)
+```
+
+## Add predictions
+```{r}
+pred_mod1 <- predict(assess1,
+                   newdata = test,
+                   type = "response")
+
+pred_mod_df1 <- as.data.frame(pred_mod1)
+
+pred_mod_df_all <- bind_cols(pred_mod_df1, test)
+
+pred_mod2 <- predict(assess2,
+                   newdata = test,
+                   type = "response")
+
+pred_mod_df2 <- as.data.frame(pred_mod2)
+
+pred_mod_df_all <- bind_cols(pred_mod_df2, pred_mod_df_all)
+
+pred_mod3 <- predict(additional,
+                   newdata = test,
+                   type = "response")
+
+pred_mod_df3 <- as.data.frame(pred_mod3)
+
+pred_mod_df_all <- bind_cols(pred_mod_df3, pred_mod_df_all)
+```
+
+## AUC Values for different models
+```{r}
+pROC::roc(response = pred_mod_df_all$fail, 
+          predictor = pred_mod_df_all$pred_mod1)
+
+pROC::roc(response = pred_mod_df_all$fail, 
+          predictor = pred_mod_df_all$pred_mod2)
+
+pROC::roc(response = pred_mod_df_all$fail, 
+          predictor = pred_mod_df_all$pred_mod3)
+```
+
+## Calibration plots
+```{r}
+cal_plot(pred_mod_df_all,
+         outcome = 'fail', 
+         prediction = 'pred_mod2',
+         n_bins = 15,
+         show_loess = T)
+```
+
+```{r}
+cal_plot(pred_mod_df_all,
+         outcome = 'fail', 
+         prediction = 'pred_mod3',
+         n_bins = 15,
+         show_loess = T)
+```
+
+## Threshold plots
+```{r}
+threshperf_plot(pred_mod_df_all,
+                outcome = 'fail',
+                prediction = 'pred_mod2')
+```
+
+```{r}
+threshperf_plot(pred_mod_df_all,
+                outcome = 'fail',
+                prediction = 'pred_mod3')
+```
+
+## Decision curves
+```{r}
+dca(fail ~ pred_mod2 + pred_mod3, 
+    data = subset(pred_mod_df_all),
+  thresholds = seq(.1, 0.65, by = 0.01),
+  label = list(pred_mod2 = "Baseline",
+               pred_mod3 = "Additional")) %>%
+  plot(smooth = TRUE)
+```
+
+```{r}
+dca(fail ~ pred_mod2 + pred_mod3, 
+    data = subset(pred_mod_df_all),
+  thresholds = seq(.1, 0.65, by = 0.01),
+  label = list(pred_mod2 = "Baseline",
+               pred_mod3 = "Additional")) %>%
+  net_intervention_avoided()
+```
